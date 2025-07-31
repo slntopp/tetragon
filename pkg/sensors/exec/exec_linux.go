@@ -149,10 +149,11 @@ func execParse(reader *bytes.Reader) (processapi.MsgProcess, bool, error) {
 		args = nil
 	}
 
-	// At this point, 'args' holds the buffer containing [arguments_string]
+	// At this point, 'args' holds the buffer containing [arguments_string]\0\0[environment_string]
 	// or 'args' is nil if filename parsing consumed everything or an error occurred.
 
 	var argsPayload []byte
+	var envsPayload []byte
 
 	if args != nil {
 		// If args are offloaded, read DataEventDesc struct for args
@@ -227,13 +228,44 @@ func execParse(reader *bytes.Reader) (processapi.MsgProcess, bool, error) {
 		}
 	}
 
+	// Process environment variables
+	if exec.Flags&api.EventErrorEnvs != 0 {
+		proc.Envs = "error reading envs"
+	} else if exec.Flags&api.EventDataEnvs != 0 {
+		// Environment variables stored in separate data event
+		if envsPayload != nil && len(envsPayload) >= int(unsafe.Sizeof(dataapi.DataEventDesc{})) {
+			var descEnvs dataapi.DataEventDesc
+			drEnvs := bytes.NewReader(envsPayload)
+			if err := binary.Read(drEnvs, binary.LittleEndian, &descEnvs); err != nil {
+				proc.Envs = "error decoding envs descriptor"
+			} else {
+				actualEnvsData, err := observer.DataGet(descEnvs)
+				if err != nil {
+					proc.Envs = "error retrieving offband envs data"
+				} else {
+					d := actualEnvsData
+					if len(d) > 0 && d[len(d)-1] == 0x00 {
+						d = d[:len(d)-1]
+					}
+					proc.Envs = strutils.UTF8FromBPFBytes(bytes.ReplaceAll(d, []byte{0x00}, []byte{' '}))
+				}
+			}
+		} else {
+			proc.Envs = "envs descriptor missing or too short"
+		}
 	} else {
-		// no arguments, args should have just cwd
-		// reading it with split to get [][]byte type
-		cmdArgs = bytes.Split(args, []byte{0x00})
+		// Environment variables are inline in buffer
+		if envsPayload != nil {
+			b := envsPayload
+			if len(b) > 0 && b[len(b)-1] == 0x00 {
+				b = b[:len(b)-1]
+			}
+			proc.Envs = strutils.UTF8FromBPFBytes(bytes.ReplaceAll(b, []byte{0x00}, []byte{' '}))
+		} else {
+			proc.Envs = ""
+		}
 	}
 
-	proc.Args = strutils.UTF8FromBPFBytes(bytes.Join(cmdArgs[0:], []byte{0x00}))
 	return proc, false, nil
 }
 
